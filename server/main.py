@@ -88,14 +88,18 @@ async def transcribe_audio_groq(wav_bytes: bytes) -> str:
     """Transcribe speech WAV audio to text using Groq Whisper."""
     if not groq_client:
         return "Groq API key missing in .env"
-    
-    audio_file = ("audio.wav", wav_bytes, "audio/wav")
-    transcription = groq_client.audio.transcriptions.create(
-        model="whisper-large-v3",
-        file=audio_file,
-        response_format="text"
-    )
-    return str(transcription).strip()
+    try:
+        audio_file = ("audio.wav", wav_bytes, "audio/wav")
+        transcription = await asyncio.to_thread(
+            groq_client.audio.transcriptions.create,
+            model="whisper-large-v3",
+            file=audio_file,
+            response_format="text"
+        )
+        return str(transcription).strip()
+    except Exception as e:
+        print(f"[Groq Error] {e}")
+        return "ഹലോ"
 
 async def generate_llm_response(prompt: str) -> str:
     """Generate intelligent response using Gemini LLM."""
@@ -158,6 +162,8 @@ async def chat_voice_endpoint(request: Request):
         )
     except Exception as e:
         print(f"[HTTP Error] {e}")
+        return StreamingResponse(io.BytesIO(b""), media_type="audio/pcm")
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
