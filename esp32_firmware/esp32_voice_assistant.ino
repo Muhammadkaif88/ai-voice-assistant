@@ -54,7 +54,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ----------------- CONFIGURATION STORAGE -----------------
 Preferences preferences;
-char server_host[80] = "ai-voice-assistant.onrender.com";
+char server_host[80] = "ai-voice-assistant-fu7m.onrender.com";
 char server_port[6]  = "443";
 bool shouldSaveConfig = false;
 
@@ -304,8 +304,11 @@ void setup() {
 
   // Load Saved Host
   preferences.begin("voicebot", true);
-  String savedHost = preferences.getString("server_host", "ai-voice-assistant.onrender.com");
+  String savedHost = preferences.getString("server_host", "ai-voice-assistant-fu7m.onrender.com");
   String savedPort = preferences.getString("server_port", "443");
+  if (savedHost == "ai-voice-assistant.onrender.com" || savedHost.length() < 5) {
+    savedHost = "ai-voice-assistant-fu7m.onrender.com";
+  }
   savedHost.toCharArray(server_host, 80);
   savedPort.toCharArray(server_port, 6);
   preferences.end();
