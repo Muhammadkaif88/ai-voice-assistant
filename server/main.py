@@ -109,13 +109,23 @@ async def generate_llm_response(prompt: str) -> str:
         return "ക്ഷമിക്കണം, എനിക്ക് ഉത്തരം കണ്ടെത്താൻ സാധിച്ചില്ല."
 
 async def synthesize_speech_edge_tts(text: str, voice: str = TTS_VOICE) -> bytes:
-    """Convert text to MP3 audio bytes using Microsoft Edge TTS."""
+    """Convert text to 16kHz 16-bit mono PCM audio bytes."""
     communicate = edge_tts.Communicate(text, voice)
     audio_stream = io.BytesIO()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             audio_stream.write(chunk["data"])
-    return audio_stream.getvalue()
+    
+    mp3_bytes = audio_stream.getvalue()
+    
+    try:
+        from pydub import AudioSegment
+        audio_seg = AudioSegment.from_file(io.BytesIO(mp3_bytes), format="mp3")
+        audio_seg = audio_seg.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        return audio_seg.raw_data
+    except Exception as e:
+        print(f"[Audio Conversion Warning] {e}")
+        return mp3_bytes
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

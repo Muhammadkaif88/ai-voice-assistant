@@ -7,3 +7,5 @@ edge-tts>=6.1.10
 python-dotenv>=1.0.1
 pydantic>=2.6.0
 numpy>=1.26.0
+pydub>=0.25.1
+

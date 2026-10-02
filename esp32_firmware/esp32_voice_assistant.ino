@@ -1,20 +1,19 @@
 /*
  ============================================================================
-  Project: ESP32 AI Voice Assistant (with WiFiManager & Captive Portal)
+  Project: ESP32 AI Voice Assistant (Native I2S - No Library Conflicts)
   Features:
     - Captive Portal (WiFiManager): Connect via phone hotspot setup
-    - Web Config for WiFi SSID, Password & Python Server IP
+    - Web Config for WiFi SSID, Password & Python Server IP/Domain
     - Long-press Button (5s) to Reset WiFi / Change Network
-    - INMP441 I2S Microphone (Speech Input)
-    - MAX98357A I2S Amplifier + Speaker (Speech Output)
+    - INMP441 I2S Microphone (Speech Input - Port 0)
+    - MAX98357A I2S Amplifier + Speaker (Speech Output - Port 1)
     - SSD1306 OLED Animated Eyes & Status
  ============================================================================
   Required Arduino Libraries:
-    1. WiFiManager (by tzapu) -> Install from Library Manager
+    1. WiFiManager (by tzapu)
     2. ArduinoJson (by Benoit Blanchon)
     3. WebSockets (by Markus Sattler)
     4. Adafruit SSD1306 & Adafruit GFX Library
-    5. ESP8266Audio (by Earle F. Philhower, III)
  ============================================================================
 */
 
@@ -30,21 +29,16 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// Audio playback libraries (ESP8266Audio)
-#include "AudioFileSourcePROGMEM.h"
-#include "AudioGeneratorMP3.h"
-#include "AudioOutputI2S.h"
-
 // ----------------- HARDWARE PINS -----------------
 // Push-to-talk button & Reset button (BOOT Button = GPIO 0)
 #define BUTTON_PIN 0 
 
-// 1. INMP441 Microphone (I2S Port 0)
+// 1. INMP441 Microphone (I2S Port 0 - Input)
 #define I2S_MIC_WS   25
 #define I2S_MIC_SD   32
 #define I2S_MIC_SCK  33
 
-// 2. MAX98357A Amplifier (I2S Port 1)
+// 2. MAX98357A Amplifier (I2S Port 1 - Output)
 #define I2S_SPK_BCLK 26
 #define I2S_SPK_LRC  27
 #define I2S_SPK_DIN  14
@@ -59,14 +53,10 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Preferences preferences;
 char server_host[80] = "ai-voice-assistant.onrender.com";
 char server_port[6]  = "443";
-
-// Flag for saving new config
 bool shouldSaveConfig = false;
 
 // ----------------- GLOBAL OBJECTS -----------------
 WebSocketsClient webSocket;
-AudioGeneratorMP3 *mp3 = NULL;
-AudioOutputI2S *out = NULL;
 
 enum BotState { STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_SPEAKING, STATE_PORTAL };
 BotState currentState = STATE_IDLE;
@@ -128,7 +118,7 @@ void drawEyes(BotState state) {
   display.display();
 }
 
-// ----------------- I2S MICROPHONE INIT -----------------
+// ----------------- I2S MICROPHONE INIT (PORT 0) -----------------
 void initI2SMic() {
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -151,6 +141,32 @@ void initI2SMic() {
 
   i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pin_config);
+}
+
+// ----------------- I2S SPEAKER AMPLIFIER INIT (PORT 1) -----------------
+void initI2SSpeaker() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = 16000,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 512,
+    .use_apll = false
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SPK_BCLK,
+    .ws_io_num = I2S_SPK_LRC,
+    .data_out_num = I2S_SPK_DIN,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+
+  i2s_driver_install(I2S_NUM_1, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_1, &pin_config);
+  i2s_set_clk(I2S_NUM_1, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 }
 
 // ----------------- WEBSOCKET HANDLER -----------------
@@ -181,13 +197,18 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       }
       else if (strcmp(msgType, "audio_end") == 0) {
         Serial.println("[WS] Audio stream playback finished");
+        currentState = STATE_IDLE;
+        drawEyes(currentState);
       }
       break;
     }
     
-    case WStype_BIN:
-      // Binary MP3 audio chunks received for speaker
+    case WStype_BIN: {
+      // Play incoming PCM audio directly to speaker
+      size_t bytesWritten = 0;
+      i2s_write(I2S_NUM_1, (const char*)payload, length, &bytesWritten, portMAX_DELAY);
       break;
+    }
   }
 }
 
@@ -204,14 +225,13 @@ void startWiFiManager(bool forcePortal = false) {
   WiFiManager wm;
   wm.setSaveConfigCallback(saveConfigCallback);
 
-  // Custom parameters for Server IP and Port
-  WiFiManagerParameter custom_server_host("server", "Python Server IP", server_host, 40);
+  // Custom parameters for Server IP/Domain and Port
+  WiFiManagerParameter custom_server_host("server", "Python Server IP / Domain", server_host, 80);
   WiFiManagerParameter custom_server_port("port", "Server Port", server_port, 6);
   
   wm.addParameter(&custom_server_host);
   wm.addParameter(&custom_server_port);
 
-  // Set timeout so it doesn't get stuck forever
   wm.setConfigPortalTimeout(180); // 3 minutes timeout
 
   bool res;
@@ -249,7 +269,6 @@ void startWiFiManager(bool forcePortal = false) {
   hostStr.replace("https://", "");
   hostStr.replace("ws://", "");
   hostStr.replace("wss://", "");
-  // remove any trailing slashes or paths
   int slashIdx = hostStr.indexOf('/');
   if (slashIdx != -1) {
     hostStr = hostStr.substring(0, slashIdx);
@@ -287,18 +306,14 @@ void setup() {
 
   // Load Saved Server IP from Flash
   preferences.begin("voicebot", true);
-  String savedHost = preferences.getString("server_host", "192.168.1.100");
-  String savedPort = preferences.getString("server_port", "8000");
-  savedHost.toCharArray(server_host, 40);
+  String savedHost = preferences.getString("server_host", "ai-voice-assistant.onrender.com");
+  String savedPort = preferences.getString("server_port", "443");
+  savedHost.toCharArray(server_host, 80);
   savedPort.toCharArray(server_port, 6);
   preferences.end();
 
-  // Audio Amp Setup
-  out = new AudioOutputI2S();
-  out->SetPinout(I2S_SPK_BCLK, I2S_SPK_LRC, I2S_SPK_DIN);
-  out->SetGain(0.8);
-
-  // Mic Setup
+  // Speaker & Mic Setup using Native I2S
+  initI2SSpeaker();
   initI2SMic();
 
   // Check if button is held at boot (Force WiFi Reset)
@@ -377,15 +392,6 @@ void loop() {
     i2s_read(I2S_NUM_0, (void*)micBuffer, MIC_BUFFER_SIZE, &bytesRead, portMAX_DELAY);
     if (bytesRead > 0) {
       webSocket.sendBIN(micBuffer, bytesRead);
-    }
-  }
-
-  // Handle MP3 playback loop
-  if (mp3 && mp3->isRunning()) {
-    if (!mp3->loop()) {
-      mp3->stop();
-      currentState = STATE_IDLE;
-      drawEyes(currentState);
     }
   }
 }
