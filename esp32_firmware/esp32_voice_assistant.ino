@@ -195,15 +195,14 @@ void sendAudioToAIServer() {
 
   WiFiClientSecure client;
   client.setInsecure();               // Disable strict SSL certificate validation
-  client.setBufferSizes(2048, 1024);  // Drastically save TLS RAM footprint for ESP32
-  client.setTimeout(25000);
+  client.setTimeout(25);              // 25s timeout for AI response
 
   HTTPClient http;
   http.setReuse(false);
-  String url = "https://" + String(server_host) + "/api/chat-voice";
   
-  if (http.begin(client, url)) {
+  if (http.begin(client, server_host, 443, "/api/chat-voice", true)) {
     http.addHeader("Content-Type", "application/octet-stream");
+    http.addHeader("Host", String(server_host));
     
     int httpCode = http.POST(audioRecordBuffer, audioRecordSize);
     Serial.printf("[HTTP] Response code: %d\n", httpCode);
