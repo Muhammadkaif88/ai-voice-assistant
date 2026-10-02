@@ -195,46 +195,85 @@ void sendAudioToAIServer() {
 
   WiFiClientSecure client;
   client.setInsecure();               // Disable strict SSL certificate validation
-  client.setTimeout(25);              // 25s timeout for AI response
+  client.setTimeout(25000);           // 25s timeout for AI response
 
-  HTTPClient http;
-  http.setReuse(false);
-  
-  if (http.begin(client, server_host, 443, "/api/chat-voice", true)) {
-    http.addHeader("Content-Type", "application/octet-stream");
-    http.addHeader("Host", String(server_host));
+  if (!client.connect(server_host, 443)) {
+    Serial.println("[TLS] Connection to Render server failed.");
+    currentState = STATE_ERROR;
+    drawEyes(currentState);
+    delay(1500);
+    audioRecordSize = 0;
+    currentState = STATE_IDLE;
+    drawEyes(currentState);
+    return;
+  }
+
+  // 1. Send HTTP POST Headers
+  String requestHeaders = "POST /api/chat-voice HTTP/1.1\r\n"
+                          "Host: " + String(server_host) + "\r\n"
+                          "Content-Type: application/octet-stream\r\n"
+                          "Content-Length: " + String(audioRecordSize) + "\r\n"
+                          "Connection: close\r\n\r\n";
+  client.print(requestHeaders);
+
+  // 2. Send Audio Data in safe 2048-byte chunks (Bypasses TLS 16KB frame limit)
+  size_t bytesSent = 0;
+  while (bytesSent < audioRecordSize && client.connected()) {
+    size_t chunkSize = (audioRecordSize - bytesSent > 2048) ? 2048 : (audioRecordSize - bytesSent);
+    client.write(audioRecordBuffer + bytesSent, chunkSize);
+    bytesSent += chunkSize;
+    delay(1);
+  }
+  Serial.printf("[TLS] Uploaded %d bytes audio. Waiting for AI reply...\n", bytesSent);
+
+  // 3. Read HTTP Response Status Line
+  unsigned long waitStart = millis();
+  while (!client.available() && client.connected() && (millis() - waitStart < 20000)) {
+    delay(50);
+  }
+
+  String statusLine = client.readStringUntil('\n');
+  Serial.printf("[HTTP] %s\n", statusLine.c_str());
+
+  if (statusLine.indexOf("200") != -1) {
+    // Skip response headers until empty line "\r\n"
+    while (client.connected()) {
+      String line = client.readStringUntil('\n');
+      if (line == "\r" || line.length() == 0) {
+        break; // Body starts now
+      }
+    }
+
+    currentState = STATE_SPEAKING;
+    drawEyes(currentState);
+
+    // 4. Stream response PCM audio directly into speaker I2S
+    uint8_t playBuffer[1024];
+    size_t totalReceived = 0;
     
-    int httpCode = http.POST(audioRecordBuffer, audioRecordSize);
-    Serial.printf("[HTTP] Response code: %d\n", httpCode);
-
-    if (httpCode == HTTP_CODE_OK) {
-      currentState = STATE_SPEAKING;
-      drawEyes(currentState);
-
-      WiFiClient *stream = http.getStreamPtr();
-      uint8_t playBuffer[1024];
-      
-      while (http.connected() && stream->available()) {
-        int bytesRead = stream->readBytes(playBuffer, sizeof(playBuffer));
+    while (client.connected() || client.available()) {
+      int availableBytes = client.available();
+      if (availableBytes > 0) {
+        int bytesToRead = (availableBytes > (int)sizeof(playBuffer)) ? sizeof(playBuffer) : availableBytes;
+        int bytesRead = client.readBytes(playBuffer, bytesToRead);
         if (bytesRead > 0) {
+          totalReceived += bytesRead;
           size_t bytesWritten = 0;
           i2s_write(I2S_NUM_1, (const char*)playBuffer, bytesRead, &bytesWritten, pdMS_TO_TICKS(100));
         }
+      } else {
+        delay(5);
       }
-      Serial.println("[AI] Finished playing response.");
-    } else {
-      Serial.printf("[HTTP Error] Code: %d, Error: %s\n", httpCode, http.errorToString(httpCode).c_str());
-      currentState = STATE_ERROR;
-      drawEyes(currentState);
-      delay(1500);
     }
-    http.end();
+    Serial.printf("[AI] Finished playing response (%d bytes PCM audio).\n", totalReceived);
   } else {
-    Serial.println("[HTTP] Unable to connect to server.");
+    Serial.println("[HTTP Error] Server did not return 200 OK");
     currentState = STATE_ERROR;
     drawEyes(currentState);
     delay(1500);
   }
+
+  client.stop();
 
   // Reset back to IDLE
   audioRecordSize = 0;
