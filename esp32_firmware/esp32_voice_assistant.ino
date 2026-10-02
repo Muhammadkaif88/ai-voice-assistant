@@ -1,14 +1,13 @@
 /*
  ============================================================================
-  Project: ESP32 AI Voice Assistant (Ultra Stable - No Reset Loops)
+  Project: ESP32 AI Voice Assistant (Hands-Free Auto-VAD & Wake Detection)
   Features:
-    - Brownout Detector Disabled (Prevents sudden power-drop resets)
-    - Captive Portal (WiFiManager): AP Hotspot "AI-Voice-Bot" (Password: 12345678)
-    - Web Config for WiFi SSID, Password & Render Server Domain
-    - Click-to-Talk (Press BOOT once to start, Press once to send)
-    - INMP441 I2S Microphone (Port 0)
-    - MAX98357A I2S Amplifier + Speaker (Port 1)
-    - 0.96" SSD1306 OLED (I2C)
+    - 100% Hands-Free: Automatically detects when you start talking
+    - Auto-Silence Detection: Detects when you stop talking (1.3s) & sends to AI
+    - Captive Portal (WiFiManager): AP Hotspot "AI-Voice-Bot" (Pass: 12345678)
+    - Native I2S for INMP441 Mic (Port 0) & MAX98357A Speaker (Port 1)
+    - SSD1306 OLED Animated Expressions
+    - Optional: BOOT Button (Manual override click if in noisy room)
  ============================================================================
 */
 
@@ -24,19 +23,19 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// Disable ESP32 Brownout Reset
+// Disable Brownout Reset
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
 // ----------------- HARDWARE PINS -----------------
-#define BUTTON_PIN 0 // BOOT button
+#define BUTTON_PIN 0 // Optional manual click
 
-// 1. INMP441 Microphone (I2S Port 0)
+// 1. INMP441 Microphone (I2S Port 0 - Input)
 #define I2S_MIC_WS   25
 #define I2S_MIC_SD   32
 #define I2S_MIC_SCK  33
 
-// 2. MAX98357A Amplifier (I2S Port 1)
+// 2. MAX98357A Amplifier (I2S Port 1 - Output)
 #define I2S_SPK_BCLK 26
 #define I2S_SPK_LRC  27
 #define I2S_SPK_DIN  14
@@ -46,6 +45,12 @@
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ----------------- VAD (VOICE DETECTION) CONFIG -----------------
+#define VAD_THRESHOLD          1800   // Sensitivity: Lower = more sensitive, Higher = less sensitive
+#define SILENCE_TIMEOUT_MS     1300   // 1.3 seconds silence to trigger AI reply
+#define MIN_RECORDING_TIME_MS  800    // Minimum speech time to avoid accidental short noises
+#define MAX_RECORDING_TIME_MS  12000  // Maximum 12s speech limit
 
 // ----------------- CONFIGURATION STORAGE -----------------
 Preferences preferences;
@@ -61,9 +66,11 @@ BotState currentState = STATE_PORTAL;
 
 bool isRecording = false;
 #define MIC_BUFFER_SIZE 1024
-uint8_t micBuffer[MIC_BUFFER_SIZE];
+int16_t micBuffer[MIC_BUFFER_SIZE / 2];
 
 bool i2sInitialized = false;
+unsigned long speechStartTime = 0;
+unsigned long lastSoundTime = 0;
 
 // ----------------- OLED DISPLAY DRAWING -----------------
 void drawEyes(BotState state) {
@@ -86,6 +93,10 @@ void drawEyes(BotState state) {
   if (state == STATE_IDLE) {
     display.fillRoundRect(28, 20, 26, 30, 8, SSD1306_WHITE);
     display.fillRoundRect(74, 20, 26, 30, 8, SSD1306_WHITE);
+    display.setCursor(35, 56);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.print("Say something");
   } 
   else if (state == STATE_LISTENING) {
     display.fillRoundRect(24, 14, 32, 38, 12, SSD1306_WHITE);
@@ -192,7 +203,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         drawEyes(currentState);
       }
       else if (strcmp(msgType, "audio_end") == 0) {
-        Serial.println("[WS] Audio stream finished");
+        Serial.println("[WS] Audio playback finished");
         currentState = STATE_IDLE;
         drawEyes(currentState);
       }
@@ -252,7 +263,7 @@ void setupWiFiManager() {
   WiFiManager wm;
   wm.setSaveConfigCallback(saveConfigCallback);
 
-  WiFiManagerParameter custom_server_host("server", "Render Domain (e.g. your-app.onrender.com)", server_host, 80);
+  WiFiManagerParameter custom_server_host("server", "Render Domain", server_host, 80);
   WiFiManagerParameter custom_server_port("port", "Port (443 for Render)", server_port, 6);
   
   wm.addParameter(&custom_server_host);
@@ -260,7 +271,6 @@ void setupWiFiManager() {
 
   Serial.println("[WiFi] Starting WiFiManager (AI-Voice-Bot)...");
   
-  // Start AP & wait until user configures WiFi (No restart loop!)
   if (wm.autoConnect("AI-Voice-Bot", "12345678")) {
     Serial.println("[WiFi] Connected! IP: " + WiFi.localIP().toString());
     
@@ -272,7 +282,6 @@ void setupWiFiManager() {
       preferences.putString("server_host", server_host);
       preferences.putString("server_port", server_port);
       preferences.end();
-      Serial.println("[Config] Saved server settings.");
     }
 
     connectToCloudServer();
@@ -281,7 +290,6 @@ void setupWiFiManager() {
 
 // ----------------- SETUP -----------------
 void setup() {
-  // Disable Brownout reset so weak USB doesn't reboot ESP32
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   Serial.begin(115200);
@@ -306,63 +314,80 @@ void setup() {
   setupWiFiManager();
 }
 
-// ----------------- LOOP -----------------
-unsigned long lastDebounceTime = 0;
-int lastButtonState = HIGH;
-int currentButtonState = HIGH;
-unsigned long recordingStartTime = 0;
+// ----------------- AUDIO RMS CALCULATION (VAD) -----------------
+float calculateAudioRMS(int16_t *buffer, size_t samples) {
+  if (samples == 0) return 0.0;
+  int64_t sumSquares = 0;
+  for (size_t i = 0; i < samples; i++) {
+    int32_t val = buffer[i];
+    sumSquares += (val * val);
+  }
+  return sqrt((float)sumSquares / samples);
+}
 
+// ----------------- MAIN LOOP (HANDS-FREE AUTO-VAD) -----------------
 void loop() {
   webSocket.loop();
 
-  int reading = digitalRead(BUTTON_PIN);
-
-  // Debounce
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
+  // Only listen when not in speaking/thinking state
+  if (currentState == STATE_SPEAKING || currentState == STATE_PORTAL) {
+    return;
   }
 
-  if ((millis() - lastDebounceTime) > 80) {
-    if (reading != currentButtonState) {
-      currentButtonState = reading;
+  size_t bytesRead = 0;
+  if (i2sInitialized) {
+    i2s_read(I2S_NUM_0, (void*)micBuffer, sizeof(micBuffer), &bytesRead, 10);
+  }
 
-      // When BOOT button is clicked
-      if (currentButtonState == LOW) {
-        if (!isRecording) {
-          isRecording = true;
-          recordingStartTime = millis();
-          currentState = STATE_LISTENING;
-          drawEyes(currentState);
-          webSocket.sendTXT("{\"event\":\"START_RECORDING\"}");
-          Serial.println("[Voice] Started recording...");
-        } else {
-          isRecording = false;
-          webSocket.sendTXT("{\"event\":\"STOP_RECORDING\"}");
-          Serial.println("[Voice] Stopped recording. Sending to AI...");
-          currentState = STATE_THINKING;
-          drawEyes(currentState);
-        }
+  if (bytesRead > 0) {
+    size_t samples = bytesRead / sizeof(int16_t);
+    float rms = calculateAudioRMS(micBuffer, samples);
+
+    // 1. If currently IDLE and user starts speaking:
+    if (!isRecording && currentState == STATE_IDLE) {
+      if (rms > VAD_THRESHOLD) {
+        isRecording = true;
+        speechStartTime = millis();
+        lastSoundTime = millis();
+        currentState = STATE_LISTENING;
+        drawEyes(currentState);
+        webSocket.sendTXT("{\"event\":\"START_RECORDING\"}");
+        Serial.printf("[VAD] Voice Detected! (RMS: %.0f) -> Listening...\n", rms);
+      }
+    }
+
+    // 2. If currently RECORDING / LISTENING:
+    else if (isRecording) {
+      // Send audio chunk to server
+      webSocket.sendBIN((uint8_t*)micBuffer, bytesRead);
+
+      if (rms > VAD_THRESHOLD) {
+        lastSoundTime = millis(); // User is still actively talking
+      }
+
+      unsigned long currentSpeechDuration = millis() - speechStartTime;
+      unsigned long silenceDuration = millis() - lastSoundTime;
+
+      // Auto-stop if user stops talking (Silence for 1.3s) OR max 12s reached
+      if ((silenceDuration > SILENCE_TIMEOUT_MS && currentSpeechDuration > MIN_RECORDING_TIME_MS) || (currentSpeechDuration > MAX_RECORDING_TIME_MS)) {
+        isRecording = false;
+        webSocket.sendTXT("{\"event\":\"STOP_RECORDING\"}");
+        Serial.printf("[VAD] Silence detected (Duration: %lums) -> Sending to AI...\n", currentSpeechDuration);
+        currentState = STATE_THINKING;
+        drawEyes(currentState);
       }
     }
   }
 
-  lastButtonState = reading;
-
-  // Auto-stop recording if 12 seconds passed
-  if (isRecording && (millis() - recordingStartTime > 12000)) {
-    isRecording = false;
-    webSocket.sendTXT("{\"event\":\"STOP_RECORDING\"}");
-    Serial.println("[Voice] Max time reached. Sent to AI...");
-    currentState = STATE_THINKING;
+  // Optional: Manual BOOT Button click backup
+  if (digitalRead(BUTTON_PIN) == LOW && !isRecording && currentState == STATE_IDLE) {
+    isRecording = true;
+    speechStartTime = millis();
+    lastSoundTime = millis();
+    currentState = STATE_LISTENING;
     drawEyes(currentState);
-  }
-
-  // Stream Mic Audio while speaking
-  if (isRecording) {
-    size_t bytesRead = 0;
-    i2s_read(I2S_NUM_0, (void*)micBuffer, MIC_BUFFER_SIZE, &bytesRead, portMAX_DELAY);
-    if (bytesRead > 0) {
-      webSocket.sendBIN(micBuffer, bytesRead);
-    }
+    webSocket.sendTXT("{\"event\":\"START_RECORDING\"}");
+    Serial.println("[Button] Manual trigger started...");
+    delay(200);
   }
 }
