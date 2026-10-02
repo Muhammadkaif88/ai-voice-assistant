@@ -180,13 +180,17 @@ void initI2SPeripherals() {
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
   switch(type) {
     case WStype_DISCONNECTED:
-      Serial.println("[WS] Disconnected from server");
+      Serial.println("[WS] Disconnected from server (Reconnecting in 3s...)");
       break;
       
     case WStype_CONNECTED:
       Serial.println("[WS] Connected to AI Voice Server!");
       currentState = STATE_IDLE;
       drawEyes(currentState);
+      break;
+
+    case WStype_ERROR:
+      Serial.printf("[WS] Error occurred: %s\n", payload ? (char*)payload : "unknown");
       break;
       
     case WStype_TEXT: {
@@ -228,6 +232,7 @@ void saveConfigCallback() {
 // ----------------- WIFI SETUP -----------------
 void connectToCloudServer() {
   String hostStr = String(server_host);
+  hostStr.trim();
   hostStr.replace("http://", "");
   hostStr.replace("https://", "");
   hostStr.replace("ws://", "");
@@ -243,14 +248,14 @@ void connectToCloudServer() {
   bool isCloudDomain = (hostStr.indexOf(".onrender.com") != -1 || hostStr.indexOf(".app") != -1 || hostStr.indexOf(".com") != -1 || port == 443);
 
   if (isCloudDomain) {
-    Serial.printf("[WS] Connecting Secure WSS: %s:443/ws\n", server_host);
+    Serial.printf("[WS] Connecting Secure WSS: wss://%s/ws\n", server_host);
     webSocket.beginSSL(server_host, 443, "/ws");
   } else {
-    Serial.printf("[WS] Connecting WS: %s:%d/ws\n", server_host, port);
+    Serial.printf("[WS] Connecting WS: ws://%s:%d/ws\n", server_host, port);
     webSocket.begin(server_host, port, "/ws");
   }
   webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
+  webSocket.setReconnectInterval(3000);
 
   initI2SPeripherals();
   currentState = STATE_IDLE;
