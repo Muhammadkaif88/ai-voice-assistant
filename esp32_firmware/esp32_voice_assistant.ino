@@ -197,8 +197,18 @@ void sendAudioToAIServer() {
   client.setInsecure();               // Disable strict SSL certificate validation
   client.setTimeout(25000);           // 25s timeout for AI response
 
-  if (!client.connect(server_host, 443)) {
-    Serial.println("[TLS] Connection to Render server failed.");
+  bool connected = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    if (client.connect(server_host, 443)) {
+      connected = true;
+      break;
+    }
+    Serial.printf("[TLS] Connect attempt %d failed, retrying...\n", attempt);
+    delay(500);
+  }
+
+  if (!connected) {
+    Serial.println("[TLS] Connection to Render server failed after 3 attempts.");
     currentState = STATE_ERROR;
     drawEyes(currentState);
     delay(1500);
