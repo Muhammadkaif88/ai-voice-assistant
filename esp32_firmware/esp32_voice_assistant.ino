@@ -57,8 +57,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ----------------- CONFIGURATION STORAGE -----------------
 Preferences preferences;
-char server_host[40] = "192.168.1.100";
-char server_port[6]  = "8000";
+char server_host[80] = "ai-voice-assistant.onrender.com";
+char server_port[6]  = "443";
 
 // Flag for saving new config
 bool shouldSaveConfig = false;
@@ -243,10 +243,30 @@ void startWiFiManager(bool forcePortal = false) {
 
   Serial.println("[WiFi] Connected successfully! Local IP: " + WiFi.localIP().toString());
   
-  // Connect WebSocket to configured Server
+  // Clean up server_host if user pasted full URL (e.g. https://... or wss://...)
+  String hostStr = String(server_host);
+  hostStr.replace("http://", "");
+  hostStr.replace("https://", "");
+  hostStr.replace("ws://", "");
+  hostStr.replace("wss://", "");
+  // remove any trailing slashes or paths
+  int slashIdx = hostStr.indexOf('/');
+  if (slashIdx != -1) {
+    hostStr = hostStr.substring(0, slashIdx);
+  }
+  hostStr.trim();
+  hostStr.toCharArray(server_host, 80);
+
   int port = atoi(server_port);
-  Serial.printf("[WS] Connecting to %s:%d/ws\n", server_host, port);
-  webSocket.begin(server_host, port, "/ws");
+  bool isCloudDomain = (hostStr.indexOf(".onrender.com") != -1 || hostStr.indexOf(".app") != -1 || hostStr.indexOf(".com") != -1 || port == 443);
+
+  if (isCloudDomain) {
+    Serial.printf("[WS] Connecting securely (WSS) to %s:443/ws\n", server_host);
+    webSocket.beginSSL(server_host, 443, "/ws");
+  } else {
+    Serial.printf("[WS] Connecting to %s:%d/ws\n", server_host, port);
+    webSocket.begin(server_host, port, "/ws");
+  }
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
 
