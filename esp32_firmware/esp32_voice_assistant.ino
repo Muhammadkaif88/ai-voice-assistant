@@ -1,23 +1,20 @@
 /*
  ============================================================================
-  Project: ESP32 AI Voice Assistant (Hands-Free Auto-VAD & Wake Detection)
+  Project: ESP32 AI Voice Assistant (Ultra-Reliable HTTPS Streaming)
   Features:
-    - 100% Hands-Free: Automatically detects when you start talking
-    - Auto-Silence Detection: Detects when you stop talking (1.3s) & sends to AI
-    - Captive Portal (WiFiManager): AP Hotspot "AI-Voice-Bot" (Pass: 12345678)
+    - 100% Hands-Free Auto-VAD voice detection
+    - HTTPS Direct Audio Stream (Zero WebSocket disconnect / SSL errors)
+    - Captive Portal (WiFiManager): AP "AI-Voice-Bot" (Pass: 12345678)
     - Native I2S for INMP441 Mic (Port 0) & MAX98357A Speaker (Port 1)
     - SSD1306 OLED Animated Expressions
-    - Optional: BOOT Button (Manual override click if in noisy room)
  ============================================================================
 */
 
 #include <WiFi.h>
-#include <WebServer.h>
-#include <DNSServer.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <WiFiManager.h>          // WiFiManager by tzapu
 #include <Preferences.h>
-#include <WebSocketsClient.h>
-#include <ArduinoJson.h>
 #include <driver/i2s.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -28,7 +25,7 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ----------------- HARDWARE PINS -----------------
-#define BUTTON_PIN 0 // Optional manual click
+#define BUTTON_PIN 0 // BOOT button (Optional manual click)
 
 // 1. INMP441 Microphone (I2S Port 0 - Input)
 #define I2S_MIC_WS   25
@@ -47,26 +44,22 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ----------------- VAD (VOICE DETECTION) CONFIG -----------------
-#define VAD_THRESHOLD          1800   // Sensitivity: Lower = more sensitive, Higher = less sensitive
-#define SILENCE_TIMEOUT_MS     1300   // 1.3 seconds silence to trigger AI reply
-#define MIN_RECORDING_TIME_MS  800    // Minimum speech time to avoid accidental short noises
-#define MAX_RECORDING_TIME_MS  12000  // Maximum 12s speech limit
+#define VAD_THRESHOLD          1800   // Sensitivity threshold
+#define SILENCE_TIMEOUT_MS     1300   // Silence duration before sending to AI
+#define MIN_RECORDING_TIME_MS  800    // Minimum speech duration
+#define MAX_AUDIO_BYTES        (16000 * 2 * 10) // 10 seconds max buffer
 
 // ----------------- CONFIGURATION STORAGE -----------------
 Preferences preferences;
 char server_host[80] = "ai-voice-assistant-fu7m.onrender.com";
-char server_port[6]  = "443";
 bool shouldSaveConfig = false;
 
-// ----------------- GLOBAL OBJECTS -----------------
-WebSocketsClient webSocket;
-
-enum BotState { STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_SPEAKING, STATE_PORTAL };
+enum BotState { STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_SPEAKING, STATE_PORTAL, STATE_ERROR };
 BotState currentState = STATE_PORTAL;
 
 bool isRecording = false;
-#define MIC_BUFFER_SIZE 1024
-int16_t micBuffer[MIC_BUFFER_SIZE / 2];
+uint8_t *audioRecordBuffer = NULL;
+size_t audioRecordSize = 0;
 
 bool i2sInitialized = false;
 unsigned long speechStartTime = 0;
@@ -93,10 +86,10 @@ void drawEyes(BotState state) {
   if (state == STATE_IDLE) {
     display.fillRoundRect(28, 20, 26, 30, 8, SSD1306_WHITE);
     display.fillRoundRect(74, 20, 26, 30, 8, SSD1306_WHITE);
-    display.setCursor(35, 56);
+    display.setCursor(25, 56);
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
-    display.print("Say something");
+    display.print("Say something...");
   } 
   else if (state == STATE_LISTENING) {
     display.fillRoundRect(24, 14, 32, 38, 12, SSD1306_WHITE);
@@ -120,6 +113,14 @@ void drawEyes(BotState state) {
     display.drawLine(48, 50, 80, 50, SSD1306_WHITE);
     display.drawLine(52, 54, 76, 54, SSD1306_WHITE);
   }
+  else if (state == STATE_ERROR) {
+    display.fillRoundRect(30, 20, 24, 10, 3, SSD1306_WHITE);
+    display.fillRoundRect(74, 20, 24, 10, 3, SSD1306_WHITE);
+    display.setCursor(20, 56);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.print("Server Retry...");
+  }
   display.display();
 }
 
@@ -127,7 +128,7 @@ void drawEyes(BotState state) {
 void initI2SPeripherals() {
   if (i2sInitialized) return;
 
-  // 1. INMP441 Microphone (Port 0 - RX)
+  // 1. INMP441 Mic (Port 0)
   i2s_config_t mic_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = 16000,
@@ -149,7 +150,7 @@ void initI2SPeripherals() {
   i2s_driver_install(I2S_NUM_0, &mic_config, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &mic_pins);
 
-  // 2. MAX98357A Speaker (Port 1 - TX)
+  // 2. MAX98357A Speaker (Port 1)
   i2s_config_t spk_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = 16000,
@@ -176,92 +177,71 @@ void initI2SPeripherals() {
   Serial.println("[I2S] Audio hardware initialized.");
 }
 
-// ----------------- WEBSOCKET HANDLER -----------------
-void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-  switch(type) {
-    case WStype_DISCONNECTED:
-      Serial.println("[WS] Disconnected from server (Reconnecting in 3s...)");
-      break;
-      
-    case WStype_CONNECTED:
-      Serial.println("[WS] Connected to AI Voice Server!");
-      currentState = STATE_IDLE;
-      drawEyes(currentState);
-      break;
-
-    case WStype_ERROR:
-      Serial.printf("[WS] Error occurred: %s\n", payload ? (char*)payload : "unknown");
-      break;
-      
-    case WStype_TEXT: {
-      StaticJsonDocument<512> doc;
-      deserializeJson(doc, payload);
-      const char* msgType = doc["type"];
-      
-      if (strcmp(msgType, "state") == 0) {
-        const char* val = doc["value"];
-        if (strcmp(val, "idle") == 0) currentState = STATE_IDLE;
-        else if (strcmp(val, "listening") == 0) currentState = STATE_LISTENING;
-        else if (strcmp(val, "thinking") == 0) currentState = STATE_THINKING;
-        else if (strcmp(val, "speaking") == 0) currentState = STATE_SPEAKING;
-        drawEyes(currentState);
-      }
-      else if (strcmp(msgType, "audio_end") == 0) {
-        Serial.println("[WS] Audio playback finished");
-        currentState = STATE_IDLE;
-        drawEyes(currentState);
-      }
-      break;
-    }
-    
-    case WStype_BIN: {
-      if (length > 0 && i2sInitialized) {
-        size_t bytesWritten = 0;
-        i2s_write(I2S_NUM_1, (const char*)payload, length, &bytesWritten, pdMS_TO_TICKS(100));
-      }
-      break;
-    }
-  }
-}
-
 void saveConfigCallback() {
   Serial.println("Config updated by user.");
   shouldSaveConfig = true;
 }
 
-// ----------------- WIFI SETUP -----------------
-void connectToCloudServer() {
-  String hostStr = String(server_host);
-  hostStr.trim();
-  hostStr.replace("http://", "");
-  hostStr.replace("https://", "");
-  hostStr.replace("ws://", "");
-  hostStr.replace("wss://", "");
-  int slashIdx = hostStr.indexOf('/');
-  if (slashIdx != -1) {
-    hostStr = hostStr.substring(0, slashIdx);
+// ----------------- SEND AUDIO TO AI SERVER VIA HTTPS -----------------
+void sendAudioToAIServer() {
+  if (audioRecordSize < 1600) {
+    Serial.println("[AI] Audio too short, ignoring.");
+    currentState = STATE_IDLE;
+    drawEyes(currentState);
+    return;
   }
-  hostStr.trim();
-  hostStr.toCharArray(server_host, 80);
 
-  int port = atoi(server_port);
-  bool isCloudDomain = (hostStr.indexOf(".onrender.com") != -1 || hostStr.indexOf(".app") != -1 || hostStr.indexOf(".com") != -1 || port == 443);
+  Serial.printf("[AI] Sending %d bytes to Render AI Server...\n", audioRecordSize);
 
-  if (isCloudDomain) {
-    Serial.printf("[WS] Connecting Secure WSS: wss://%s/ws\n", server_host);
-    webSocket.beginSSL(server_host, 443, "/ws");
+  WiFiClientSecure client;
+  client.setInsecure(); // Disable strict certificate validation for 100% reliability
+  client.setTimeout(25000); // 25s timeout for AI response
+
+  HTTPClient http;
+  String url = "https://" + String(server_host) + "/api/chat-voice";
+  
+  if (http.begin(client, url)) {
+    http.addHeader("Content-Type", "application/octet-stream");
+    
+    int httpCode = http.POST(audioRecordBuffer, audioRecordSize);
+    Serial.printf("[HTTP] Response code: %d\n", httpCode);
+
+    if (httpCode == HTTP_CODE_OK) {
+      currentState = STATE_SPEAKING;
+      drawEyes(currentState);
+
+      WiFiClient *stream = http.getStreamPtr();
+      uint8_t playBuffer[1024];
+      
+      while (http.connected() && stream->available()) {
+        int bytesRead = stream->readBytes(playBuffer, sizeof(playBuffer));
+        if (bytesRead > 0) {
+          size_t bytesWritten = 0;
+          i2s_write(I2S_NUM_1, (const char*)playBuffer, bytesRead, &bytesWritten, pdMS_TO_TICKS(100));
+        }
+      }
+      Serial.println("[AI] Finished playing response.");
+    } else {
+      Serial.printf("[HTTP Error] Server returned: %d\n", httpCode);
+      currentState = STATE_ERROR;
+      drawEyes(currentState);
+      delay(1500);
+    }
+    http.end();
   } else {
-    Serial.printf("[WS] Connecting WS: ws://%s:%d/ws\n", server_host, port);
-    webSocket.begin(server_host, port, "/ws");
+    Serial.println("[HTTP] Unable to connect to server.");
+    currentState = STATE_ERROR;
+    drawEyes(currentState);
+    delay(1500);
   }
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(3000);
 
-  initI2SPeripherals();
+  // Reset back to IDLE
+  audioRecordSize = 0;
   currentState = STATE_IDLE;
   drawEyes(currentState);
 }
 
+// ----------------- WIFI MANAGER -----------------
 void setupWiFiManager() {
   drawEyes(STATE_PORTAL);
   
@@ -269,27 +249,33 @@ void setupWiFiManager() {
   wm.setSaveConfigCallback(saveConfigCallback);
 
   WiFiManagerParameter custom_server_host("server", "Render Domain", server_host, 80);
-  WiFiManagerParameter custom_server_port("port", "Port (443 for Render)", server_port, 6);
-  
   wm.addParameter(&custom_server_host);
-  wm.addParameter(&custom_server_port);
 
   Serial.println("[WiFi] Starting WiFiManager (AI-Voice-Bot)...");
   
   if (wm.autoConnect("AI-Voice-Bot", "12345678")) {
     Serial.println("[WiFi] Connected! IP: " + WiFi.localIP().toString());
     
-    strcpy(server_host, custom_server_host.getValue());
-    strcpy(server_port, custom_server_port.getValue());
+    String newHost = String(custom_server_host.getValue());
+    newHost.trim();
+    newHost.replace("https://", "");
+    newHost.replace("http://", "");
+    int slashIdx = newHost.indexOf('/');
+    if (slashIdx != -1) newHost = newHost.substring(0, slashIdx);
+    
+    if (newHost.length() > 3) {
+      newHost.toCharArray(server_host, 80);
+    }
 
     if (shouldSaveConfig) {
       preferences.begin("voicebot", false);
       preferences.putString("server_host", server_host);
-      preferences.putString("server_port", server_port);
       preferences.end();
     }
 
-    connectToCloudServer();
+    initI2SPeripherals();
+    currentState = STATE_IDLE;
+    drawEyes(currentState);
   }
 }
 
@@ -301,6 +287,12 @@ void setup() {
   delay(200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
+  // Allocate 160KB RAM buffer for audio recording
+  audioRecordBuffer = (uint8_t*)ps_malloc(MAX_AUDIO_BYTES);
+  if (!audioRecordBuffer) {
+    audioRecordBuffer = (uint8_t*)malloc(32000 * 3); // 3 seconds fallback in internal RAM
+  }
+
   // OLED Init
   Wire.begin(21, 22);
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -310,19 +302,15 @@ void setup() {
   // Load Saved Host
   preferences.begin("voicebot", true);
   String savedHost = preferences.getString("server_host", "ai-voice-assistant-fu7m.onrender.com");
-  String savedPort = preferences.getString("server_port", "443");
-  if (savedHost == "ai-voice-assistant.onrender.com" || savedHost.length() < 5) {
-    savedHost = "ai-voice-assistant-fu7m.onrender.com";
+  if (savedHost.length() > 5) {
+    savedHost.toCharArray(server_host, 80);
   }
-  savedHost.toCharArray(server_host, 80);
-  savedPort.toCharArray(server_port, 6);
   preferences.end();
 
-  // Setup WiFi
   setupWiFiManager();
 }
 
-// ----------------- AUDIO RMS CALCULATION (VAD) -----------------
+// ----------------- AUDIO RMS (VAD) -----------------
 float calculateAudioRMS(int16_t *buffer, size_t samples) {
   if (samples == 0) return 0.0;
   int64_t sumSquares = 0;
@@ -333,70 +321,72 @@ float calculateAudioRMS(int16_t *buffer, size_t samples) {
   return sqrt((float)sumSquares / samples);
 }
 
-// ----------------- MAIN LOOP (HANDS-FREE AUTO-VAD) -----------------
-void loop() {
-  webSocket.loop();
+// ----------------- MAIN LOOP -----------------
+int16_t sampleChunk[256];
 
-  // Only listen and read mic when strictly in IDLE or LISTENING state
+void loop() {
   if (currentState != STATE_IDLE && currentState != STATE_LISTENING) {
-    delay(5);
+    delay(10);
     return;
   }
 
   size_t bytesRead = 0;
   if (i2sInitialized) {
-    i2s_read(I2S_NUM_0, (void*)micBuffer, sizeof(micBuffer), &bytesRead, pdMS_TO_TICKS(20));
+    i2s_read(I2S_NUM_0, (void*)sampleChunk, sizeof(sampleChunk), &bytesRead, pdMS_TO_TICKS(20));
   }
 
   if (bytesRead > 0) {
     size_t samples = bytesRead / sizeof(int16_t);
-    float rms = calculateAudioRMS(micBuffer, samples);
+    float rms = calculateAudioRMS(sampleChunk, samples);
 
-    // 1. If currently IDLE and user starts speaking:
+    // 1. Idle -> User starts speaking
     if (!isRecording && currentState == STATE_IDLE) {
       if (rms > VAD_THRESHOLD) {
         isRecording = true;
+        audioRecordSize = 0;
         speechStartTime = millis();
         lastSoundTime = millis();
         currentState = STATE_LISTENING;
         drawEyes(currentState);
-        webSocket.sendTXT("{\"event\":\"START_RECORDING\"}");
-        Serial.printf("[VAD] Voice Detected! (RMS: %.0f) -> Listening...\n", rms);
+        Serial.printf("[VAD] Voice Detected! (RMS: %.0f)\n", rms);
       }
     }
 
-    // 2. If currently RECORDING / LISTENING:
+    // 2. Listening -> Store Audio in Buffer
     else if (isRecording) {
-      // Send audio chunk to server
-      webSocket.sendBIN((uint8_t*)micBuffer, bytesRead);
+      if (audioRecordBuffer && (audioRecordSize + bytesRead < (32000 * 3))) {
+        memcpy(audioRecordBuffer + audioRecordSize, sampleChunk, bytesRead);
+        audioRecordSize += bytesRead;
+      }
 
       if (rms > VAD_THRESHOLD) {
-        lastSoundTime = millis(); // User is still actively talking
+        lastSoundTime = millis();
       }
 
       unsigned long currentSpeechDuration = millis() - speechStartTime;
       unsigned long silenceDuration = millis() - lastSoundTime;
 
-      // Auto-stop if user stops talking (Silence for 1.3s) OR max 12s reached
-      if ((silenceDuration > SILENCE_TIMEOUT_MS && currentSpeechDuration > MIN_RECORDING_TIME_MS) || (currentSpeechDuration > MAX_RECORDING_TIME_MS)) {
+      // Stop speech when silence is detected
+      if ((silenceDuration > SILENCE_TIMEOUT_MS && currentSpeechDuration > MIN_RECORDING_TIME_MS) || (currentSpeechDuration > 7000)) {
         isRecording = false;
-        webSocket.sendTXT("{\"event\":\"STOP_RECORDING\"}");
-        Serial.printf("[VAD] Silence detected (Duration: %lums) -> Sending to AI...\n", currentSpeechDuration);
         currentState = STATE_THINKING;
         drawEyes(currentState);
+        Serial.printf("[VAD] Silence detected -> Processing (%d bytes)...\n", audioRecordSize);
+        
+        sendAudioToAIServer();
       }
     }
   }
 
-  // Optional: Manual BOOT Button click backup
+  // Optional manual BOOT button
   if (digitalRead(BUTTON_PIN) == LOW && !isRecording && currentState == STATE_IDLE) {
     isRecording = true;
+    audioRecordSize = 0;
     speechStartTime = millis();
     lastSoundTime = millis();
     currentState = STATE_LISTENING;
     drawEyes(currentState);
-    webSocket.sendTXT("{\"event\":\"START_RECORDING\"}");
-    Serial.println("[Button] Manual trigger started...");
+    Serial.println("[Button] Recording started...");
     delay(200);
   }
 }

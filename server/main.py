@@ -125,8 +125,39 @@ async def synthesize_speech_edge_tts(text: str, voice: str = TTS_VOICE) -> bytes
         return audio_seg.raw_data
     except Exception as e:
         print(f"[Audio Conversion Warning] {e}")
-        return mp3_bytes
-
+@app.post("/api/chat-voice")
+async def chat_voice_endpoint(request: Request):
+    """Receive raw PCM audio from ESP32, process with Whisper + Gemini + Edge-TTS, stream back PCM audio."""
+    try:
+        pcm_bytes = await request.body()
+        print(f"[HTTP Voice] Received {len(pcm_bytes)} bytes audio from ESP32")
+        
+        if len(pcm_bytes) < 1600:
+            return StreamingResponse(io.BytesIO(b""), media_type="audio/pcm")
+            
+        wav_data = pcm_to_wav_bytes(pcm_bytes)
+        user_text = await transcribe_audio_groq(wav_data)
+        print(f"[HTTP User Said]: {user_text}")
+        
+        if not user_text or len(user_text.strip()) == 0:
+            user_text = "ഹലോ"
+            
+        ai_reply = await generate_llm_response(user_text)
+        print(f"[HTTP AI Reply]: {ai_reply}")
+        
+        tts_pcm = await synthesize_speech_edge_tts(ai_reply)
+        print(f"[HTTP TTS] Generated {len(tts_pcm)} bytes PCM audio. Streaming to ESP32...")
+        
+        return StreamingResponse(
+            io.BytesIO(tts_pcm), 
+            media_type="audio/pcm",
+            headers={
+                "X-User-Text": user_text[:100],
+                "X-AI-Reply": ai_reply[:100]
+            }
+        )
+    except Exception as e:
+        print(f"[HTTP Error] {e}")
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
