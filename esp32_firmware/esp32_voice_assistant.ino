@@ -191,13 +191,15 @@ void sendAudioToAIServer() {
     return;
   }
 
-  Serial.printf("[AI] Sending %d bytes to Render AI Server...\n", audioRecordSize);
+  Serial.printf("[AI] Sending %d bytes to Render AI Server (Free Heap: %d)...\n", audioRecordSize, ESP.getFreeHeap());
 
   WiFiClientSecure client;
-  client.setInsecure(); // Disable strict certificate validation for 100% reliability
-  client.setTimeout(25000); // 25s timeout for AI response
+  client.setInsecure();               // Disable strict SSL certificate validation
+  client.setBufferSizes(2048, 1024);  // Drastically save TLS RAM footprint for ESP32
+  client.setTimeout(25000);
 
   HTTPClient http;
+  http.setReuse(false);
   String url = "https://" + String(server_host) + "/api/chat-voice";
   
   if (http.begin(client, url)) {
@@ -222,7 +224,7 @@ void sendAudioToAIServer() {
       }
       Serial.println("[AI] Finished playing response.");
     } else {
-      Serial.printf("[HTTP Error] Server returned: %d\n", httpCode);
+      Serial.printf("[HTTP Error] Code: %d, Error: %s\n", httpCode, http.errorToString(httpCode).c_str());
       currentState = STATE_ERROR;
       drawEyes(currentState);
       delay(1500);
@@ -287,10 +289,10 @@ void setup() {
   delay(200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  // Allocate 160KB RAM buffer for audio recording
+  // Allocate RAM buffer for audio recording (2-3 seconds)
   audioRecordBuffer = (uint8_t*)ps_malloc(MAX_AUDIO_BYTES);
   if (!audioRecordBuffer) {
-    audioRecordBuffer = (uint8_t*)malloc(32000 * 3); // 3 seconds fallback in internal RAM
+    audioRecordBuffer = (uint8_t*)malloc(64000); // 2 seconds in internal RAM
   }
 
   // OLED Init
