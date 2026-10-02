@@ -1,26 +1,20 @@
 /*
  ============================================================================
-  Project: ESP32 AI Voice Assistant (Native I2S - No Library Conflicts)
+  Project: ESP32 AI Voice Assistant (Rock Solid WiFi & Native I2S)
   Features:
-    - Captive Portal (WiFiManager): Connect via phone hotspot setup
-    - Web Config for WiFi SSID, Password & Python Server IP/Domain
-    - Long-press Button (5s) to Reset WiFi / Change Network
-    - INMP441 I2S Microphone (Speech Input - Port 0)
-    - MAX98357A I2S Amplifier + Speaker (Speech Output - Port 1)
-    - SSD1306 OLED Animated Eyes & Status
- ============================================================================
-  Required Arduino Libraries:
-    1. WiFiManager (by tzapu)
-    2. ArduinoJson (by Benoit Blanchon)
-    3. WebSockets (by Markus Sattler)
-    4. Adafruit SSD1306 & Adafruit GFX Library
+    - Captive Portal (WiFiManager): AP Hotspot "AI-Voice-Bot" (Password: 12345678 or Open)
+    - Web Config for WiFi SSID, Password & Render Server Domain
+    - Long-press BOOT button (5s) to Reset WiFi
+    - INMP441 I2S Microphone (Port 0)
+    - MAX98357A I2S Amplifier + Speaker (Port 1)
+    - 0.96" SSD1306 OLED (I2C)
  ============================================================================
 */
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
-#include <WiFiManager.h>          // https://github.com/tzapu/WiFiManager
+#include <WiFiManager.h>          // WiFiManager by tzapu
 #include <Preferences.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
@@ -28,17 +22,17 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "esp_task_wdt.h"
 
 // ----------------- HARDWARE PINS -----------------
-// Push-to-talk button & Reset button (BOOT Button = GPIO 0)
-#define BUTTON_PIN 0 
+#define BUTTON_PIN 0 // Onboard BOOT button
 
-// 1. INMP441 Microphone (I2S Port 0 - Input)
+// 1. INMP441 Microphone (I2S Port 0)
 #define I2S_MIC_WS   25
 #define I2S_MIC_SD   32
 #define I2S_MIC_SCK  33
 
-// 2. MAX98357A Amplifier (I2S Port 1 - Output)
+// 2. MAX98357A Amplifier (I2S Port 1)
 #define I2S_SPK_BCLK 26
 #define I2S_SPK_LRC  27
 #define I2S_SPK_DIN  14
@@ -59,7 +53,7 @@ bool shouldSaveConfig = false;
 WebSocketsClient webSocket;
 
 enum BotState { STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_SPEAKING, STATE_PORTAL };
-BotState currentState = STATE_IDLE;
+BotState currentState = STATE_PORTAL;
 
 bool isRecording = false;
 #define MIC_BUFFER_SIZE 1024
@@ -67,6 +61,7 @@ uint8_t micBuffer[MIC_BUFFER_SIZE];
 
 unsigned long buttonPressStartTime = 0;
 bool buttonWasPressed = false;
+bool i2sInitialized = false;
 
 // ----------------- OLED DISPLAY DRAWING -----------------
 void drawEyes(BotState state) {
@@ -76,17 +71,18 @@ void drawEyes(BotState state) {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.println("WiFi Setup Mode");
+    display.println(">> WiFi Setup <<");
     display.println("---------------------");
-    display.println("Connect to WiFi:");
-    display.println(">> AI-Voice-Bot <<");
-    display.println("Open IP: 192.168.4.1");
+    display.println("Connect to WiFi AP:");
+    display.println("AI-Voice-Bot");
+    display.println("Pass: 12345678");
+    display.println("IP: 192.168.4.1");
     display.display();
     return;
   }
   
   if (state == STATE_IDLE) {
-    // Friendly open eyes
+    // Normal friendly eyes
     display.fillRoundRect(28, 20, 26, 30, 8, SSD1306_WHITE);
     display.fillRoundRect(74, 20, 26, 30, 8, SSD1306_WHITE);
   } 
@@ -118,9 +114,12 @@ void drawEyes(BotState state) {
   display.display();
 }
 
-// ----------------- I2S MICROPHONE INIT (PORT 0) -----------------
-void initI2SMic() {
-  i2s_config_t i2s_config = {
+// ----------------- I2S INITIALIZATION -----------------
+void initI2SPeripherals() {
+  if (i2sInitialized) return;
+
+  // 1. INMP441 Microphone (Port 0 - RX)
+  i2s_config_t mic_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = 16000,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
@@ -132,41 +131,40 @@ void initI2SMic() {
     .use_apll = false
   };
 
-  i2s_pin_config_t pin_config = {
+  i2s_pin_config_t mic_pins = {
     .bck_io_num = I2S_MIC_SCK,
     .ws_io_num = I2S_MIC_WS,
     .data_out_num = I2S_PIN_NO_CHANGE,
     .data_in_num = I2S_MIC_SD
   };
+  i2s_driver_install(I2S_NUM_0, &mic_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &mic_pins);
 
-  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_NUM_0, &pin_config);
-}
-
-// ----------------- I2S SPEAKER AMPLIFIER INIT (PORT 1) -----------------
-void initI2SSpeaker() {
-  i2s_config_t i2s_config = {
+  // 2. MAX98357A Speaker (Port 1 - TX)
+  i2s_config_t spk_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = 16000,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
+    .dma_buf_count = 6,
     .dma_buf_len = 512,
     .use_apll = false
   };
 
-  i2s_pin_config_t pin_config = {
+  i2s_pin_config_t spk_pins = {
     .bck_io_num = I2S_SPK_BCLK,
     .ws_io_num = I2S_SPK_LRC,
     .data_out_num = I2S_SPK_DIN,
     .data_in_num = I2S_PIN_NO_CHANGE
   };
-
-  i2s_driver_install(I2S_NUM_1, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_NUM_1, &pin_config);
+  i2s_driver_install(I2S_NUM_1, &spk_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_1, &spk_pins);
   i2s_set_clk(I2S_NUM_1, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+
+  i2sInitialized = true;
+  Serial.println("[I2S] Audio peripherals initialized.");
 }
 
 // ----------------- WEBSOCKET HANDLER -----------------
@@ -196,7 +194,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         drawEyes(currentState);
       }
       else if (strcmp(msgType, "audio_end") == 0) {
-        Serial.println("[WS] Audio stream playback finished");
+        Serial.println("[WS] Audio stream finished");
         currentState = STATE_IDLE;
         drawEyes(currentState);
       }
@@ -204,66 +202,67 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     }
     
     case WStype_BIN: {
-      // Play incoming PCM audio directly to speaker
-      size_t bytesWritten = 0;
-      i2s_write(I2S_NUM_1, (const char*)payload, length, &bytesWritten, portMAX_DELAY);
+      if (length > 0) {
+        size_t bytesWritten = 0;
+        i2s_write(I2S_NUM_1, (const char*)payload, length, &bytesWritten, portMAX_DELAY);
+      }
       break;
     }
   }
 }
 
-// Callback notifying us of the need to save config
 void saveConfigCallback() {
-  Serial.println("Should save config");
+  Serial.println("Config updated by user.");
   shouldSaveConfig = true;
 }
 
-// ----------------- CAPTIVE PORTAL (WIFI MANAGER) -----------------
+// ----------------- CAPTIVE PORTAL -----------------
 void startWiFiManager(bool forcePortal = false) {
   drawEyes(STATE_PORTAL);
   
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect();
+  delay(100);
+
   WiFiManager wm;
   wm.setSaveConfigCallback(saveConfigCallback);
+  wm.setConfigPortalTimeout(240); // 4 minutes
 
-  // Custom parameters for Server IP/Domain and Port
-  WiFiManagerParameter custom_server_host("server", "Python Server IP / Domain", server_host, 80);
-  WiFiManagerParameter custom_server_port("port", "Server Port", server_port, 6);
+  WiFiManagerParameter custom_server_host("server", "Render Domain (e.g. your-app.onrender.com)", server_host, 80);
+  WiFiManagerParameter custom_server_port("port", "Port (443 for Render)", server_port, 6);
   
   wm.addParameter(&custom_server_host);
   wm.addParameter(&custom_server_port);
 
-  wm.setConfigPortalTimeout(180); // 3 minutes timeout
-
   bool res;
   if (forcePortal) {
-    Serial.println("[WiFi] Starting Config Portal On Demand...");
-    res = wm.startConfigPortal("AI-Voice-Bot");
+    Serial.println("[WiFi] Starting AP: AI-Voice-Bot (Pass: 12345678)");
+    res = wm.startConfigPortal("AI-Voice-Bot", "12345678");
   } else {
-    Serial.println("[WiFi] Connecting or Auto-starting Portal...");
-    res = wm.autoConnect("AI-Voice-Bot"); 
+    Serial.println("[WiFi] Attempting autoConnect or AP...");
+    res = wm.autoConnect("AI-Voice-Bot", "12345678");
   }
 
   if (!res) {
-    Serial.println("[WiFi] Failed to connect or hit timeout. Restarting...");
+    Serial.println("[WiFi] Failed to connect or timeout. Retrying...");
     ESP.restart();
   }
 
-  // Read updated parameters
+  // Update server parameters if saved
   strcpy(server_host, custom_server_host.getValue());
   strcpy(server_port, custom_server_port.getValue());
 
-  // Save to persistent Flash memory (NVS Preferences)
   if (shouldSaveConfig) {
     preferences.begin("voicebot", false);
     preferences.putString("server_host", server_host);
     preferences.putString("server_port", server_port);
     preferences.end();
-    Serial.println("[Config] New Server IP saved to Flash memory!");
+    Serial.println("[Config] Saved settings to flash.");
   }
 
-  Serial.println("[WiFi] Connected successfully! Local IP: " + WiFi.localIP().toString());
+  Serial.println("[WiFi] Connected! IP: " + WiFi.localIP().toString());
   
-  // Clean up server_host if user pasted full URL (e.g. https://... or wss://...)
+  // Format host URL
   String hostStr = String(server_host);
   hostStr.replace("http://", "");
   hostStr.replace("https://", "");
@@ -280,14 +279,17 @@ void startWiFiManager(bool forcePortal = false) {
   bool isCloudDomain = (hostStr.indexOf(".onrender.com") != -1 || hostStr.indexOf(".app") != -1 || hostStr.indexOf(".com") != -1 || port == 443);
 
   if (isCloudDomain) {
-    Serial.printf("[WS] Connecting securely (WSS) to %s:443/ws\n", server_host);
+    Serial.printf("[WS] Connecting WSS: %s:443/ws\n", server_host);
     webSocket.beginSSL(server_host, 443, "/ws");
   } else {
-    Serial.printf("[WS] Connecting to %s:%d/ws\n", server_host, port);
+    Serial.printf("[WS] Connecting WS: %s:%d/ws\n", server_host, port);
     webSocket.begin(server_host, port, "/ws");
   }
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
+
+  // Initialize I2S Audio now that WiFi is connected
+  initI2SPeripherals();
 
   currentState = STATE_IDLE;
   drawEyes(currentState);
@@ -296,15 +298,16 @@ void startWiFiManager(bool forcePortal = false) {
 // ----------------- SETUP -----------------
 void setup() {
   Serial.begin(115200);
+  delay(500); // Allow power supply to settle
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   // OLED Init
   Wire.begin(21, 22);
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED init failed");
+    Serial.println("OLED init error");
   }
 
-  // Load Saved Server IP from Flash
+  // Load Saved Host
   preferences.begin("voicebot", true);
   String savedHost = preferences.getString("server_host", "ai-voice-assistant.onrender.com");
   String savedPort = preferences.getString("server_port", "443");
@@ -312,81 +315,82 @@ void setup() {
   savedPort.toCharArray(server_port, 6);
   preferences.end();
 
-  // Speaker & Mic Setup using Native I2S
-  initI2SSpeaker();
-  initI2SMic();
-
-  // Check if button is held at boot (Force WiFi Reset)
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    Serial.println("[WiFi] BOOT Button held during startup -> Resetting WiFi...");
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(10, 25);
-    display.println("Resetting WiFi...");
-    display.display();
-    delay(2000);
-    startWiFiManager(true);
-  } else {
-    startWiFiManager(false);
-  }
+  // Start WiFi
+  startWiFiManager(false);
 }
 
 // ----------------- LOOP -----------------
+unsigned long lastDebounceTime = 0;
+int lastButtonState = HIGH;
+int currentButtonState = HIGH;
+unsigned long recordingStartTime = 0;
+
 void loop() {
   webSocket.loop();
 
-  int buttonState = digitalRead(BUTTON_PIN);
+  int reading = digitalRead(BUTTON_PIN);
 
-  // Check for Long Press (5 seconds) to Reset WiFi at runtime
-  if (buttonState == LOW) {
-    if (!buttonWasPressed) {
-      buttonWasPressed = true;
-      buttonPressStartTime = millis();
-    } 
-    else {
-      unsigned long pressDuration = millis() - buttonPressStartTime;
-      if (pressDuration > 5000) { // Held for 5 seconds
-        Serial.println("[Reset] 5s long press -> Clearing WiFi & Opening Portal...");
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setTextColor(SSD1306_WHITE);
-        display.setCursor(5, 25);
-        display.println("WiFi Reset Triggered!");
-        display.display();
-        delay(1500);
+  // Software Debounce
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > 50) {
+    // If the button state has stably changed
+    if (reading != currentButtonState) {
+      currentButtonState = reading;
+
+      // Button Just Pressed (Falling Edge)
+      if (currentButtonState == LOW) {
+        buttonPressStartTime = millis();
         
-        WiFiManager wm;
-        wm.resetSettings(); // Clear saved WiFi
-        ESP.restart();
+        // Toggle Recording: Click to start, Click again to stop
+        if (!isRecording) {
+          isRecording = true;
+          recordingStartTime = millis();
+          currentState = STATE_LISTENING;
+          drawEyes(currentState);
+          webSocket.sendTXT("{\"event\":\"START_RECORDING\"}");
+          Serial.println("[Voice] >>> Click: Listening Started...");
+        } else {
+          isRecording = false;
+          webSocket.sendTXT("{\"event\":\"STOP_RECORDING\"}");
+          Serial.println("[Voice] >>> Click: Stopped. Sending to AI...");
+          currentState = STATE_THINKING;
+          drawEyes(currentState);
+        }
       }
     }
-  } 
-  else {
-    buttonWasPressed = false;
+
+    // Long press check (Only if held continuously for 8 full seconds)
+    if (currentButtonState == LOW && (millis() - buttonPressStartTime > 8000)) {
+      Serial.println("[Reset] 8s Long Press -> Resetting WiFi...");
+      display.clearDisplay();
+      display.setCursor(10, 25);
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.println("Resetting WiFi...");
+      display.display();
+      delay(1500);
+
+      WiFiManager wm;
+      wm.resetSettings();
+      ESP.restart();
+    }
   }
 
-  // Push-to-talk voice recording logic
-  bool buttonPressed = (buttonState == LOW);
+  lastButtonState = reading;
 
-  if (buttonPressed && !isRecording && (millis() - buttonPressStartTime < 4500)) {
-    isRecording = true;
-    currentState = STATE_LISTENING;
-    drawEyes(currentState);
-    webSocket.sendTXT("{\"event\":\"START_RECORDING\"}");
-    Serial.println("Recording Started...");
-    delay(150);
-  } 
-  else if (!buttonPressed && isRecording) {
+  // Auto-stop recording after 12 seconds max (in case user forgets to click again)
+  if (isRecording && (millis() - recordingStartTime > 12000)) {
     isRecording = false;
     webSocket.sendTXT("{\"event\":\"STOP_RECORDING\"}");
-    Serial.println("Recording Stopped. Sending to AI...");
+    Serial.println("[Voice] Auto-stopped (Max 12s). Sending to AI...");
     currentState = STATE_THINKING;
     drawEyes(currentState);
-    delay(150);
   }
 
-  // Stream Mic Audio chunks while speaking
+  // Stream Mic Audio while recording
   if (isRecording) {
     size_t bytesRead = 0;
     i2s_read(I2S_NUM_0, (void*)micBuffer, MIC_BUFFER_SIZE, &bytesRead, portMAX_DELAY);
