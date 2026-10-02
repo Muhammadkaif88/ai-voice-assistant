@@ -211,9 +211,9 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     }
     
     case WStype_BIN: {
-      if (length > 0) {
+      if (length > 0 && i2sInitialized) {
         size_t bytesWritten = 0;
-        i2s_write(I2S_NUM_1, (const char*)payload, length, &bytesWritten, portMAX_DELAY);
+        i2s_write(I2S_NUM_1, (const char*)payload, length, &bytesWritten, pdMS_TO_TICKS(100));
       }
       break;
     }
@@ -332,14 +332,15 @@ float calculateAudioRMS(int16_t *buffer, size_t samples) {
 void loop() {
   webSocket.loop();
 
-  // Only listen when not in speaking/thinking state
-  if (currentState == STATE_SPEAKING || currentState == STATE_PORTAL) {
+  // Only listen and read mic when strictly in IDLE or LISTENING state
+  if (currentState != STATE_IDLE && currentState != STATE_LISTENING) {
+    delay(5);
     return;
   }
 
   size_t bytesRead = 0;
   if (i2sInitialized) {
-    i2s_read(I2S_NUM_0, (void*)micBuffer, sizeof(micBuffer), &bytesRead, 10);
+    i2s_read(I2S_NUM_0, (void*)micBuffer, sizeof(micBuffer), &bytesRead, pdMS_TO_TICKS(20));
   }
 
   if (bytesRead > 0) {
